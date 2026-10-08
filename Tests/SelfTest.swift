@@ -17,7 +17,9 @@ struct SelfTest {
         try testForkProtocolUsesOfficialMethodAndTargetProvider()
         try testForkResponseScannerHandlesChunkedLargeResponse()
         try testSafeSwitchUpdatesJSONLAndDatabaseWithBackups()
+        try testBatchSwitchChecksIndependentRootsAndWritesOnce()
         try testSafeSwitchFromOfficialToExternal()
+        try testProviderBoundItemIDsBlockEvenForcedSwitch()
         try testRepairsDatabaseWhenRolloutAlreadyUsesTargetProvider()
         try testRepairsCompatibilityWhenAlreadyOfficial()
         try testRiskGuardBlocksMutationWithoutExplicitOverride()
@@ -570,6 +572,49 @@ struct SelfTest {
         )
     }
 
+    private static func testBatchSwitchChecksIndependentRootsAndWritesOnce() throws {
+        let fixture = try Fixture(
+            inputTokens: 1_000,
+            includeInternalReview: true,
+            targetProvider: "custom",
+            internalReviewProvider: "openai"
+        )
+        defer { fixture.cleanup() }
+
+        let store = CodexStore(codexHome: fixture.root)
+        let tasks = try store.loadTasks()
+        let source = try require(
+            tasks.first(where: { $0.id == Fixture.sourceID }),
+            "Batch source task missing"
+        )
+        let target = try require(
+            tasks.first(where: { $0.id == Fixture.targetID }),
+            "Batch second root missing"
+        )
+        let child = try require(
+            tasks.first(where: { $0.id == Fixture.childID }),
+            "Batch child missing"
+        )
+        let group = [source, target, child]
+        let preflight = try store.preflight(tasks: group, targetProvider: "openai")
+        try expect(preflight.level == .safe, "Batch roots should pass preflight")
+        try expect(
+            preflight.message.contains("批量检查 2 个主任务"),
+            "Batch preflight did not identify both independent roots"
+        )
+
+        let result = try store.switchTasks(tasks: group, targetProvider: "openai")
+        try expect(result.changedTasks == 3, "Batch switch did not update every related thread")
+        try expect(result.rolloutBackups.count == 3, "Batch switch did not back up every rollout")
+        let updated = try store.loadTasks()
+        try expect(
+            group.allSatisfy { original in
+                updated.first(where: { $0.id == original.id })?.provider == "openai"
+            },
+            "Batch switch left a thread on the old provider"
+        )
+    }
+
     private static func testRiskGuardBlocksMutationWithoutExplicitOverride() throws {
         let fixture = try Fixture(inputTokens: 17_000)
         defer { fixture.cleanup() }
@@ -619,6 +664,43 @@ struct SelfTest {
         try expect(updated.provider == "custom", "Official task did not switch to external")
         let rollout = try String(contentsOfFile: updated.rolloutPath, encoding: .utf8)
         try expect(rollout.contains(#""model_provider":"custom""#), "External JSONL was not updated")
+    }
+
+    private static func testProviderBoundItemIDsBlockEvenForcedSwitch() throws {
+        let fixture = try Fixture(inputTokens: 1_000, includeProviderBoundItem: true)
+        defer { fixture.cleanup() }
+
+        let store = CodexStore(codexHome: fixture.root)
+        let task = try require(
+            store.loadTasks().first(where: { $0.id == Fixture.sourceID }),
+            "Provider-bound task missing"
+        )
+        let preflight = try store.preflight(task: task, targetProvider: "openai")
+        try expect(
+            preflight.level == .blockedIncompatible,
+            "Provider-bound item IDs should block a cross-provider switch"
+        )
+        try expect(preflight.providerBoundItemIDs == 1, "Provider-bound item count was wrong")
+
+        var wasBlocked = false
+        do {
+            _ = try store.switchTask(
+                task: task,
+                targetProvider: "openai",
+                allowRisk: true
+            )
+        } catch {
+            wasBlocked = true
+        }
+        try expect(wasBlocked, "Forced switch bypassed provider-bound item protection")
+
+        let unchanged = try require(
+            store.loadTasks().first(where: { $0.id == Fixture.sourceID }),
+            "Blocked task missing after preflight"
+        )
+        try expect(unchanged.provider == "custom", "Blocked database was modified")
+        let rollout = try String(contentsOfFile: unchanged.rolloutPath, encoding: .utf8)
+        try expect(rollout.contains(#""model_provider":"custom""#), "Blocked rollout was modified")
     }
 
     private static func testRepairsDatabaseWhenRolloutAlreadyUsesTargetProvider() throws {
@@ -686,7 +768,13 @@ private final class Fixture {
     let root: URL
     private let sessions: URL
 
-    init(inputTokens: Int = 1_000, includeInternalReview: Bool = false) throws {
+    init(
+        inputTokens: Int = 1_000,
+        includeInternalReview: Bool = false,
+        includeProviderBoundItem: Bool = false,
+        targetProvider: String = "openai",
+        internalReviewProvider: String = "custom"
+    ) throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexProviderSwitcherTests-\(UUID().uuidString)", isDirectory: true)
         sessions = root.appendingPathComponent("sessions", isDirectory: true)
@@ -725,12 +813,13 @@ private final class Fixture {
             provider: "custom",
             inputTokens: inputTokens,
             contextWindow: 20_000,
-            legacyToolSearchID: "ts_fixture_0"
+            legacyToolSearchID: "ts_fixture_0",
+            includeProviderBoundItem: includeProviderBoundItem
         )
         try makeRollout(
             at: targetRollout,
             id: Self.targetID,
-            provider: "openai",
+            provider: targetProvider,
             inputTokens: 2_000,
             contextWindow: 20_000,
             legacyToolSearchID: "ts_official_fixture_0"
@@ -746,7 +835,7 @@ private final class Fixture {
             try makeRollout(
                 at: internalReviewRollout,
                 id: Self.internalReviewID,
-                provider: "custom",
+                provider: internalReviewProvider,
                 inputTokens: 1_500,
                 contextWindow: 20_000
             )
@@ -755,7 +844,9 @@ private final class Fixture {
             sourceRollout: sourceRollout,
             targetRollout: targetRollout,
             childRollout: childRollout,
-            internalReviewRollout: includeInternalReview ? internalReviewRollout : nil
+            internalReviewRollout: includeInternalReview ? internalReviewRollout : nil,
+            targetProvider: targetProvider,
+            internalReviewProvider: internalReviewProvider
         )
     }
 
@@ -769,7 +860,8 @@ private final class Fixture {
         provider: String,
         inputTokens: Int,
         contextWindow: Int,
-        legacyToolSearchID: String? = nil
+        legacyToolSearchID: String? = nil,
+        includeProviderBoundItem: Bool = false
     ) throws {
         var lines = [
             #"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"\#(id)","model_provider":"\#(provider)"}}"#,
@@ -780,6 +872,11 @@ private final class Fixture {
             lines.insert(
                 #"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"tool_search_call","id":"\#(legacyToolSearchID)","call_id":"sg_call_fixture_0","status":"completed"}}"#,
                 at: 1
+            )
+        }
+        if includeProviderBoundItem {
+            lines.append(
+                #"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","id":"msg_provider_fixture_0","role":"assistant","content":[]},"metadata":{"retained_source":{"id":{"message_id":"msg_provider_fixture_0","role":"assistant"},"revision":"retained_fixture","complete":true}}}"#
             )
         }
         try (lines.joined(separator: "\n") + "\n").write(
@@ -793,7 +890,9 @@ private final class Fixture {
         sourceRollout: URL,
         targetRollout: URL,
         childRollout: URL,
-        internalReviewRollout: URL?
+        internalReviewRollout: URL?,
+        targetProvider: String,
+        internalReviewProvider: String
     ) throws {
         var database: OpaquePointer?
         let path = root.appendingPathComponent("state_5.sqlite").path
@@ -836,7 +935,7 @@ private final class Fixture {
             database: database,
             id: Self.targetID,
             title: "容量参考任务",
-            provider: "openai",
+            provider: targetProvider,
             rolloutPath: targetRollout.path,
             updatedAt: 100,
             archived: 1,
@@ -859,13 +958,13 @@ private final class Fixture {
                 database: database,
                 id: Self.internalReviewID,
                 title: CodexTask.approvalReviewTitlePrefix + ":",
-                provider: "custom",
+                provider: internalReviewProvider,
                 rolloutPath: internalReviewRollout.path,
                 updatedAt: 300,
                 archived: 0,
                 source: "app",
                 threadSource: "user",
-                model: "gpt-5.6-luna"
+                model: internalReviewProvider == "openai" ? "test-model" : "gpt-5.6-luna"
             )
         }
     }

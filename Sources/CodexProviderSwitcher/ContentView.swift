@@ -148,7 +148,13 @@ struct ContentView: View {
             .padding(.vertical, 10)
             .background(.quaternary.opacity(0.5))
 
-            Table(model.filteredTasks, selection: $model.selectedTaskID) {
+            Table(
+                model.filteredTasks,
+                selection: Binding(
+                    get: { model.selectedTaskIDs },
+                    set: { model.setTaskSelection($0) }
+                )
+            ) {
                 TableColumn("任务") { task in
                     HStack(alignment: .top, spacing: 8) {
                         Button {
@@ -229,54 +235,64 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("所选任务")
+                        Text(model.selectedRootTaskCount > 1 ? "批量选择" : "所选任务")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                        Text(task.displayTitle)
+                        Text(
+                            model.selectedRootTaskCount > 1
+                                ? "已选择 \(model.selectedRootTaskCount) 个主任务"
+                                : task.displayTitle
+                        )
                             .font(.headline)
                             .textSelection(.enabled)
-                        Text(task.id)
+                        Text(
+                            model.selectedRootTaskCount > 1
+                                ? "连同子代理共 \(model.selectedTaskGroup.count) 个线程；完成后只重启一次"
+                                : task.id
+                        )
                             .font(.caption2.monospaced())
                             .foregroundStyle(.tertiary)
                             .textSelection(.enabled)
 
-                        Button {
-                            model.toggleImportant(task)
-                        } label: {
-                            Label(
-                                model.isImportant(task) ? "取消重要标记" : "标记为重要并置顶",
-                                systemImage: model.isImportant(task) ? "star.slash" : "star"
-                            )
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(model.isImportant(task) ? .orange : .accentColor)
+                        if model.selectedRootTaskCount == 1 {
+                            Button {
+                                model.toggleImportant(task)
+                            } label: {
+                                Label(
+                                    model.isImportant(task) ? "取消重要标记" : "标记为重要并置顶",
+                                    systemImage: model.isImportant(task) ? "star.slash" : "star"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(model.isImportant(task) ? .orange : .accentColor)
 
-                        Button {
-                            model.toggleInProgress(task)
-                        } label: {
-                            Label(
-                                model.isInProgress(task) ? "取消进行中标签" : "标记为进行中",
-                                systemImage: model.isInProgress(task) ? "pause.circle" : "play.circle"
-                            )
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(model.isInProgress(task) ? .blue : .accentColor)
+                            Button {
+                                model.toggleInProgress(task)
+                            } label: {
+                                Label(
+                                    model.isInProgress(task) ? "取消进行中标签" : "标记为进行中",
+                                    systemImage: model.isInProgress(task) ? "pause.circle" : "play.circle"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(model.isInProgress(task) ? .blue : .accentColor)
 
-                        Button {
-                            model.openInCodex(task)
-                        } label: {
-                            Label("在 Codex 中打开", systemImage: "arrow.up.forward.app")
-                        }
-                        .buttonStyle(.bordered)
-                        .help("通知 Codex 刷新任务目录并打开此任务，不会发送消息")
+                            Button {
+                                model.openInCodex(task)
+                            } label: {
+                                Label("在 Codex 中打开", systemImage: "arrow.up.forward.app")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("通知 Codex 刷新任务目录并打开此任务，不会发送消息")
 
-                        Button {
-                            model.restartCodexAndOpen(threadID: task.id)
-                        } label: {
-                            Label("重启并打开", systemImage: "arrow.clockwise.circle")
+                            Button {
+                                model.restartCodexAndOpen(threadID: task.id)
+                            } label: {
+                                Label("重启并打开", systemImage: "arrow.clockwise.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("安全退出并重新打开 Codex，等待定时任务提示处理完成后再打开此任务")
                         }
-                        .buttonStyle(.bordered)
-                        .help("安全退出并重新打开 Codex，等待定时任务提示处理完成后再打开此任务")
                     }
 
                     infoCard(task: task)
@@ -333,7 +349,7 @@ struct ContentView: View {
                     .disabled(!model.canForkAndSwitch)
                     .help("使用 Codex 官方分支功能，原任务不变")
 
-                    Text("直接切换会备份后修改原任务；新建分支会保留原任务，只让新分支使用目标提供商。切换默认不会重启 Codex；需要清除旧的内存上下文时，可手动选择“重启并打开”。")
+                    Text("直接切换会备份后修改原任务；新建分支会保留原任务。完成后 App 会把 Codex 置于前台，等待你处理可能出现的定时任务退出提醒，然后自动重新打开目标会话。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -351,17 +367,29 @@ struct ContentView: View {
 
     private func infoCard(task: CodexTask) -> some View {
         VStack(spacing: 10) {
-            infoRow(label: "当前提供商", value: ProviderOption.displayName(for: task.provider))
-            infoRow(label: "模型", value: task.model ?? "未知")
-            infoRow(label: "状态", value: task.archived ? "已归档" : "活跃")
-            if model.isInProgress(task) {
-                infoRow(label: "标签", value: "进行中")
-            }
-            let subagentCount = model.selectedSubagents.count
-            if subagentCount > 0 {
-                infoRow(label: "子代理", value: "\(subagentCount) 个（随主任务切换）")
-            } else if task.threadSource == "subagent" {
-                infoRow(label: "关系", value: "未找到主任务")
+            if model.selectedRootTaskCount > 1 {
+                infoRow(label: "主任务", value: "\(model.selectedRootTaskCount) 个")
+                infoRow(label: "全部线程", value: "\(model.selectedTaskGroup.count) 个")
+                infoRow(
+                    label: "当前提供商",
+                    value: Set(model.selectedRootTasks.map { ProviderOption.displayName(for: $0.provider) })
+                        .sorted()
+                        .joined(separator: "、")
+                )
+                infoRow(label: "重启次数", value: "1 次")
+            } else {
+                infoRow(label: "当前提供商", value: ProviderOption.displayName(for: task.provider))
+                infoRow(label: "模型", value: task.model ?? "未知")
+                infoRow(label: "状态", value: task.archived ? "已归档" : "活跃")
+                if model.isInProgress(task) {
+                    infoRow(label: "标签", value: "进行中")
+                }
+                let subagentCount = model.selectedSubagents.count
+                if subagentCount > 0 {
+                    infoRow(label: "子代理", value: "\(subagentCount) 个（随主任务切换）")
+                } else if task.threadSource == "subagent" {
+                    infoRow(label: "关系", value: "未找到主任务")
+                }
             }
         }
         .padding(14)
@@ -464,6 +492,9 @@ struct ContentView: View {
     }
 
     private func switchButtonTitle(task: CodexTask) -> String {
+        if model.selectedRootTaskCount > 1 {
+            return "批量切换 \(model.selectedRootTaskCount) 个会话到 \(ProviderOption.displayName(for: model.targetProviderID))"
+        }
         if task.provider == model.targetProviderID {
             if model.preflight.compatibilityFixes > 0 {
                 return "修复官方兼容性"
@@ -474,6 +505,9 @@ struct ContentView: View {
     }
 
     private func forkButtonTitle(task: CodexTask) -> String {
+        if model.selectedRootTaskCount > 1 {
+            return "批量选择时不可新建分支"
+        }
         if task.provider == model.targetProviderID {
             return "新建分支（保持 \(ProviderOption.displayName(for: model.targetProviderID))）"
         }
@@ -486,6 +520,8 @@ struct ContentView: View {
             return "checkmark.circle.fill"
         case .alreadyTarget:
             return "checkmark.seal.fill"
+        case .blockedIncompatible:
+            return "link.badge.plus"
         case .blockedRisk:
             return "exclamationmark.triangle.fill"
         case .blockedUnknown:
@@ -497,6 +533,8 @@ struct ContentView: View {
         switch model.preflight.level {
         case .safe, .alreadyTarget:
             return .green
+        case .blockedIncompatible:
+            return .red
         case .blockedRisk:
             return .orange
         case .blockedUnknown:
@@ -513,6 +551,8 @@ struct ContentView: View {
             return "上下文风险较低"
         case .alreadyTarget:
             return "无需切换"
+        case .blockedIncompatible:
+            return "需要配对接续会话"
         case .blockedRisk:
             return "需要确认风险"
         case .blockedUnknown:

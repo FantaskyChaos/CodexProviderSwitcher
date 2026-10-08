@@ -181,6 +181,23 @@ struct CodexStore: @unchecked Sendable {
                 targetProvider: targetProvider
             )
         }
+        let providerBoundItemIDs = try pendingTasks.reduce(into: 0) { total, task in
+            total += try providerBoundItemIDCount(task: task)
+        }
+        if providerBoundItemIDs > 0 {
+            return ContextPreflight(
+                level: .blockedIncompatible,
+                latestInputTokens: nil,
+                currentContextWindow: nil,
+                targetContextWindow: nil,
+                guardrailTokens: nil,
+                headroomTokens: nil,
+                compactedEvents: 0,
+                compatibilityFixes: compatibilityFixes,
+                providerBoundItemIDs: providerBoundItemIDs,
+                message: "检测到 \(providerBoundItemIDs) 条绑定当前供应商的历史 item ID。当前 Codex 无法跨供应商回查这些记录；原地切换或新建分支即使重启也可能报 persisted-item lookup 错误。请保留原任务，并为目标供应商建立配对接续会话。"
+            )
+        }
         if pendingTasks.isEmpty && compatibilityFixes == 0 {
             return ContextPreflight(
                 level: .alreadyTarget,
@@ -195,8 +212,7 @@ struct CodexStore: @unchecked Sendable {
             )
         }
 
-        let subagentCount = max(0, tasks.count - 1)
-        guard let primaryTask = tasks.first else {
+        guard !tasks.isEmpty else {
             return ContextPreflight(
                 level: .blockedUnknown,
                 latestInputTokens: nil,
@@ -210,13 +226,17 @@ struct CodexStore: @unchecked Sendable {
             )
         }
 
-        // Child metadata changes do not resume child threads, so only the main
-        // task needs a compaction preflight. Descendants are synchronized in
-        // the same guarded migration without being opened.
-        if primaryTask.provider == targetProvider {
+        let taskIDs = Set(tasks.map(\.id))
+        let primaryTasks = tasks.filter { task in
+            guard let parentID = task.parentThreadID else { return true }
+            return !taskIDs.contains(parentID)
+        }
+        let pendingPrimaryTasks = primaryTasks.filter { $0.provider != targetProvider }
+        let associatedCount = max(0, tasks.count - primaryTasks.count)
+        if pendingPrimaryTasks.isEmpty {
             let providerMessage = pendingTasks.isEmpty
-                ? "任务已使用目标提供商"
-                : "主任务已是目标提供商；将同步 \(pendingTasks.count) 个子代理"
+                ? "所选任务已使用目标提供商"
+                : "主任务已是目标提供商；将同步 \(pendingTasks.count) 个关联线程"
             let compatibilityMessage = compatibilityFixes > 0
                 ? "；将修复 \(compatibilityFixes) 条官方工具 ID"
                 : ""
@@ -233,17 +253,39 @@ struct CodexStore: @unchecked Sendable {
             )
         }
 
-        let targetWindow = try observedContextWindows(
-            provider: targetProvider,
-            model: primaryTask.model
-        ).min()
-        let check = try preflightTask(
-            task: primaryTask,
-            targetProvider: targetProvider,
-            targetWindow: targetWindow
-        )
-        let subagentMessage = subagentCount > 0
-            ? "；将同时同步 \(subagentCount) 个子代理"
+        var checks: [ContextPreflight] = []
+        for task in pendingPrimaryTasks {
+            let targetWindow = try observedContextWindows(
+                provider: targetProvider,
+                model: task.model
+            ).min()
+            checks.append(
+                try preflightTask(
+                    task: task,
+                    targetProvider: targetProvider,
+                    targetWindow: targetWindow
+                )
+            )
+        }
+        let severity: (PreflightLevel) -> Int = { level in
+            switch level {
+            case .blockedUnknown: return 3
+            case .blockedRisk: return 2
+            case .safe, .alreadyTarget: return 1
+            case .blockedIncompatible: return 4
+            }
+        }
+        let check = checks.max { lhs, rhs in
+            let lhsSeverity = severity(lhs.level)
+            let rhsSeverity = severity(rhs.level)
+            if lhsSeverity != rhsSeverity { return lhsSeverity < rhsSeverity }
+            return (lhs.headroomTokens ?? Int.max) > (rhs.headroomTokens ?? Int.max)
+        } ?? .unavailable
+        let batchMessage = primaryTasks.count > 1
+            ? "；批量检查 \(primaryTasks.count) 个主任务"
+            : ""
+        let associatedMessage = associatedCount > 0
+            ? "；同时同步 \(associatedCount) 个关联线程"
             : ""
         let compatibilityMessage = compatibilityFixes > 0
             ? "；将修复 \(compatibilityFixes) 条官方工具 ID"
@@ -257,7 +299,7 @@ struct CodexStore: @unchecked Sendable {
             headroomTokens: check.headroomTokens,
             compactedEvents: check.compactedEvents,
             compatibilityFixes: compatibilityFixes,
-            message: check.message + subagentMessage + compatibilityMessage
+            message: check.message + batchMessage + associatedMessage + compatibilityMessage
         )
     }
 
@@ -333,6 +375,9 @@ struct CodexStore: @unchecked Sendable {
         let check = try preflight(tasks: tasks, targetProvider: targetProvider)
         if check.level == .alreadyTarget {
             throw SwitcherError.invalidData("任务已经使用 \(ProviderOption.displayName(for: targetProvider))")
+        }
+        if check.level == .blockedIncompatible {
+            throw SwitcherError.unsafe(check.message)
         }
         if !allowRisk && (check.level == .blockedRisk || check.level == .blockedUnknown) {
             throw SwitcherError.unsafe(check.message)
@@ -688,6 +733,28 @@ struct CodexStore: @unchecked Sendable {
                   payload["type"] as? String == "tool_search_call",
                   let identifier = payload["id"] as? String,
                   officialToolSearchIdentifier(identifier) != nil else {
+                return
+            }
+            count += 1
+        }
+        return count
+    }
+
+    func providerBoundItemIDCount(task: CodexTask) throws -> Int {
+        let url = URL(fileURLWithPath: task.rolloutPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw SwitcherError.missingFile("找不到任务历史：\(url.path)")
+        }
+        var count = 0
+        try forEachLine(in: url) { data, _ in
+            guard data.range(of: Data(#""retained_source""#.utf8)) != nil,
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["type"] as? String == "response_item",
+                  let metadata = object["metadata"] as? [String: Any],
+                  metadata["retained_source"] != nil,
+                  let payload = object["payload"] as? [String: Any],
+                  let identifier = payload["id"] as? String,
+                  !identifier.isEmpty else {
                 return
             }
             count += 1

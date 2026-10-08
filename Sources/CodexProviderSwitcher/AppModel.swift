@@ -12,8 +12,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var organization: ConversationOrganization
     @Published private(set) var selectedWorkspaceScopeID = WorkspaceScope.all
     @Published private(set) var selectedTreeID: String?
+    @Published private(set) var selectedTaskIDs: Set<String> = []
     @Published var selectedTaskID: String? {
-        didSet { refreshPreflight() }
+        didSet {
+            guard !isApplyingTaskSelection else { return }
+            selectedTaskIDs = selectedTaskID.map { Set([$0]) } ?? []
+            refreshPreflight()
+        }
     }
     @Published var targetProviderID = "openai" {
         didSet { refreshPreflight() }
@@ -37,6 +42,7 @@ final class AppModel: ObservableObject {
     private let forkClient: CodexForkClient
     private let preferences: UserDefaults
     private var preflightGeneration = 0
+    private var isApplyingTaskSelection = false
     private var pendingCurrentTaskSwitch: (taskID: String, targetProvider: String)?
     private var boardUndoStacks: [String: [ConversationBoard]] = [:]
     private var boardRedoStacks: [String: [ConversationBoard]] = [:]
@@ -61,6 +67,27 @@ final class AppModel: ObservableObject {
 
     var selectedTask: CodexTask? {
         tasks.first { $0.id == selectedTaskID }
+    }
+
+    var selectedRootTasks: [CodexTask] {
+        let ids = selectedTaskIDs.isEmpty
+            ? selectedTaskID.map { Set([$0]) } ?? []
+            : selectedTaskIDs
+        return topLevelTasks.filter { ids.contains($0.id) }
+    }
+
+    var selectedRootTaskCount: Int { selectedRootTasks.count }
+
+    func setTaskSelection(_ selection: Set<String>) {
+        isApplyingTaskSelection = true
+        selectedTaskIDs = selection
+        if let selectedTaskID, selection.contains(selectedTaskID) {
+            self.selectedTaskID = selectedTaskID
+        } else {
+            self.selectedTaskID = filteredTasks.first(where: { selection.contains($0.id) })?.id
+        }
+        isApplyingTaskSelection = false
+        refreshPreflight()
     }
 
     var topLevelTasks: [CodexTask] {
@@ -1065,8 +1092,14 @@ final class AppModel: ObservableObject {
     }
 
     var selectedTaskGroup: [CodexTask] {
-        guard let selectedTask else { return [] }
-        return [selectedTask] + selectedSubagents
+        var result: [CodexTask] = []
+        var seen: Set<String> = []
+        for root in selectedRootTasks {
+            for task in [root] + descendants(of: root.id) where seen.insert(task.id).inserted {
+                result.append(task)
+            }
+        }
+        return result
     }
 
     var filteredTasks: [CodexTask] {
@@ -1106,14 +1139,17 @@ final class AppModel: ObservableObject {
     }
 
     var canSwitch: Bool {
-        !isBusy && (
+        !isBusy && preflight.level != .blockedIncompatible && (
             selectedTaskGroup.contains { $0.provider != targetProviderID }
                 || preflight.compatibilityFixes > 0
         )
     }
 
     var canForkAndSwitch: Bool {
-        !isBusy && selectedTask != nil
+        !isBusy
+            && selectedRootTaskCount == 1
+            && selectedTask != nil
+            && preflight.level != .blockedIncompatible
     }
 
     func refresh() {
@@ -1126,7 +1162,22 @@ final class AppModel: ObservableObject {
                     (try store.loadTasks(), try store.loadProviderConfiguration())
                 }.value
                 tasks = result.0
-                providers = result.1.providers
+                let configuredProviders = Dictionary(
+                    uniqueKeysWithValues: result.1.providers.map { ($0.id, $0) }
+                )
+                let taskProviderIDs = Set(result.0.map(\.provider))
+                providers = Set(configuredProviders.keys).union(taskProviderIDs)
+                    .map { id in
+                        configuredProviders[id]
+                            ?? ProviderOption(id: id, displayName: ProviderOption.displayName(for: id))
+                    }
+                    .sorted {
+                        if $0.id == result.1.activeProvider { return true }
+                        if $1.id == result.1.activeProvider { return false }
+                        if $0.id == "openai" { return true }
+                        if $1.id == "openai" { return false }
+                        return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                    }
                 activeProvider = result.1.activeProvider
                 targetProviderID = result.1.activeProvider
                 synchronizeSessionWorkspaces()
@@ -1357,6 +1408,10 @@ final class AppModel: ObservableObject {
 
     func requestSwitch() {
         guard selectedTask != nil else { return }
+        if preflight.level == .blockedIncompatible {
+            presentError(SwitcherError.unsafe(preflight.message))
+            return
+        }
         if preflight.level == .blockedRisk || preflight.level == .blockedUnknown {
             showRiskAlert = true
         } else {
@@ -1365,11 +1420,19 @@ final class AppModel: ObservableObject {
     }
 
     func forceSwitch() {
+        guard preflight.level != .blockedIncompatible else {
+            presentError(SwitcherError.unsafe(preflight.message))
+            return
+        }
         performSwitch(allowRisk: true)
     }
 
     func requestForkAndSwitch() {
-        guard selectedTask != nil else { return }
+        guard selectedTask != nil, selectedRootTaskCount == 1 else { return }
+        if preflight.level == .blockedIncompatible {
+            presentError(SwitcherError.unsafe(preflight.message))
+            return
+        }
         if preflight.level == .blockedRisk || preflight.level == .blockedUnknown {
             showForkRiskAlert = true
         } else {
@@ -1382,6 +1445,10 @@ final class AppModel: ObservableObject {
     }
 
     func forceForkAndSwitch() {
+        guard preflight.level != .blockedIncompatible else {
+            presentError(SwitcherError.unsafe(preflight.message))
+            return
+        }
         performForkAndSwitch(allowRisk: true)
     }
 
@@ -1408,6 +1475,7 @@ final class AppModel: ObservableObject {
                 }
                 statusMessage = "已请求 Codex 重新启动并打开任务"
             } catch {
+                NSRunningApplication.current.activate(options: [.activateAllWindows])
                 presentError(error)
                 statusMessage = "任务已保存，但 Codex 重新加载未完成"
             }
@@ -1442,15 +1510,24 @@ final class AppModel: ObservableObject {
                 let compatibilitySummary = value.compatibilityFixes > 0
                     ? "\n已修复 \(value.compatibilityFixes) 条官方工具 ID 兼容记录。"
                     : ""
-                resultAlertTitle = changesProvider ? "切换完成" : "兼容性修复完成"
-                resultAlertMessage = """
-                \(providerSummary)
-                已处理 \(value.changedTasks) 个线程，修改 \(value.changedRecords) 条记录，并已创建完整备份。\(compatibilitySummary)
+                statusMessage = "\(providerSummary)已创建备份，正在自动重启 Codex…"
+                do {
+                    try await CodexApplicationReloader.restartAndOpen(threadID: task.id) { [weak self] message in
+                        self?.statusMessage = message
+                    }
+                    statusMessage = "切换完成，Codex 已重新打开目标会话\(compatibilitySummary)"
+                } catch {
+                    NSRunningApplication.current.activate(options: [.activateAllWindows])
+                    resultAlertTitle = "切换已保存，但重启未完成"
+                    resultAlertMessage = """
+                    \(providerSummary)
+                    已处理 \(value.changedTasks) 个线程，修改 \(value.changedRecords) 条记录，并已创建完整备份。\(compatibilitySummary)
 
-                修改已保存，Codex 不会自动重启。当前已经打开的任务可能仍保留旧的内存上下文；需要立即重新读取时，可选择“重启并打开 Codex”。
-                """
-                statusMessage = "切换完成，未重启 Codex"
-                showResultAlert = true
+                    \(error.localizedDescription)
+                    """
+                    statusMessage = "切换已保存，但 Codex 重新加载未完成"
+                    showResultAlert = true
+                }
             case .failure(let error):
                 presentError(error)
                 statusMessage = "切换失败，原数据已保留"
@@ -1474,6 +1551,9 @@ final class AppModel: ObservableObject {
                         task: sourceTask,
                         targetProvider: target
                     )
+                    if check.level == .blockedIncompatible {
+                        throw SwitcherError.unsafe(check.message)
+                    }
                     if !allowRisk && (check.level == .blockedRisk || check.level == .blockedUnknown) {
                         throw SwitcherError.unsafe(check.message)
                     }
@@ -1523,17 +1603,26 @@ final class AppModel: ObservableObject {
                 let fallbackNote = value.usedMigrationFallback
                     ? "\n当前 Codex 版本未直接保存目标提供商，App 已仅对新分支执行备份后的安全迁移。"
                     : ""
-                resultAlertTitle = "分支已创建"
-                resultAlertMessage = """
-                原任务保持不变。
-                新分支已切换到 \(ProviderOption.displayName(for: value.targetProvider))。
+                statusMessage = "分支已创建，正在自动重启 Codex…"
+                do {
+                    try await CodexApplicationReloader.restartAndOpen(threadID: value.forkedThreadID) { [weak self] message in
+                        self?.statusMessage = message
+                    }
+                    statusMessage = "分支已创建并重新打开：\(value.forkedThreadID)\(fallbackNote)"
+                } catch {
+                    NSRunningApplication.current.activate(options: [.activateAllWindows])
+                    resultAlertTitle = "分支已创建，但重启未完成"
+                    resultAlertMessage = """
+                    原任务保持不变。
+                    新分支已切换到 \(ProviderOption.displayName(for: value.targetProvider))。
 
-                新分支 ID：\(value.forkedThreadID)\(fallbackNote)
+                    新分支 ID：\(value.forkedThreadID)\(fallbackNote)
 
-                新分支已经安全保存，Codex 不会自动重启。需要让 Codex 立即读取新分支时，可选择“在 Codex 中打开”或“重启并打开 Codex”；过程中不会发送消息或调用模型。
-                """
-                statusMessage = "分支已创建，未重启 Codex"
-                showResultAlert = true
+                    \(error.localizedDescription)
+                    """
+                    statusMessage = "分支已创建，但 Codex 重新加载未完成"
+                    showResultAlert = true
+                }
             case .failure(let error):
                 presentError(error)
                 statusMessage = "分支操作未完成，原任务未修改"

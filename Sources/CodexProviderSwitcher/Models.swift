@@ -692,6 +692,7 @@ struct ProviderConfiguration: Sendable {
 enum PreflightLevel: String, Sendable {
     case safe
     case alreadyTarget
+    case blockedIncompatible
     case blockedRisk
     case blockedUnknown
 }
@@ -705,6 +706,7 @@ struct ContextPreflight: Sendable {
     let headroomTokens: Int?
     let compactedEvents: Int
     let compatibilityFixes: Int
+    let providerBoundItemIDs: Int
     let message: String
 
     init(
@@ -716,6 +718,7 @@ struct ContextPreflight: Sendable {
         headroomTokens: Int?,
         compactedEvents: Int,
         compatibilityFixes: Int = 0,
+        providerBoundItemIDs: Int = 0,
         message: String
     ) {
         self.level = level
@@ -726,6 +729,7 @@ struct ContextPreflight: Sendable {
         self.headroomTokens = headroomTokens
         self.compactedEvents = compactedEvents
         self.compatibilityFixes = compatibilityFixes
+        self.providerBoundItemIDs = providerBoundItemIDs
         self.message = message
     }
 
@@ -738,6 +742,7 @@ struct ContextPreflight: Sendable {
         headroomTokens: nil,
         compactedEvents: 0,
         compatibilityFixes: 0,
+        providerBoundItemIDs: 0,
         message: "请选择一个任务"
     )
 }
