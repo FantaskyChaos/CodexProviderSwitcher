@@ -693,6 +693,7 @@ enum PreflightLevel: String, Sendable {
     case safe
     case alreadyTarget
     case blockedIncompatible
+    case blockedOpaqueHistory
     case blockedRisk
     case blockedUnknown
 }

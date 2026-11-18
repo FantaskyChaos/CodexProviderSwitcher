@@ -1,4 +1,5 @@
 import CSQLite
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -175,6 +176,28 @@ struct CodexStore: @unchecked Sendable {
         targetProvider: String
     ) throws -> ContextPreflight {
         let pendingTasks = tasks.filter { $0.provider != targetProvider }
+        var opaqueHistoryItemCount = 0
+        var opaqueHistoryTaskTitles: [String] = []
+        for task in tasks {
+            let replay = try replayCompatibility(task: task)
+            if replay.opaqueItems > 0 && (task.provider != targetProvider || replay.hasReplayFailure) {
+                opaqueHistoryItemCount += replay.opaqueItems
+                opaqueHistoryTaskTitles.append(task.displayTitle)
+            }
+        }
+        if opaqueHistoryItemCount > 0 {
+            let titles = opaqueHistoryTaskTitles.prefix(3).joined(separator: "、")
+            let titleSummary = opaqueHistoryTaskTitles.count > 3
+                ? "\(titles)等 \(opaqueHistoryTaskTitles.count) 个会话"
+                : titles
+            return ContextPreflight(
+                level: .blockedOpaqueHistory,
+                latestInputTokens: nil, currentContextWindow: nil,
+                targetContextWindow: nil, guardrailTokens: nil,
+                headroomTokens: nil, compactedEvents: 0,
+                message: "发现 \(opaqueHistoryItemCount) 条没有明文替代的加密历史（\(titleSummary)）。可以在确认后继续切换：当前会话副本将移除这些无法解密的块；完整原始历史会备份保留，但移除内容不能在目标供应商的续聊上下文中恢复。"
+            )
+        }
         let compatibilityFixes = try tasks.reduce(into: 0) { total, task in
             total += try officialCompatibilityFixCount(
                 task: task,
@@ -238,7 +261,7 @@ struct CodexStore: @unchecked Sendable {
                 ? "所选任务已使用目标提供商"
                 : "主任务已是目标提供商；将同步 \(pendingTasks.count) 个关联线程"
             let compatibilityMessage = compatibilityFixes > 0
-                ? "；将修复 \(compatibilityFixes) 条官方工具 ID"
+                ? "；将备份并修复 \(compatibilityFixes) 条历史兼容记录"
                 : ""
             return ContextPreflight(
                 level: .safe,
@@ -273,6 +296,7 @@ struct CodexStore: @unchecked Sendable {
             case .blockedRisk: return 2
             case .safe, .alreadyTarget: return 1
             case .blockedIncompatible: return 4
+            case .blockedOpaqueHistory: return 4
             }
         }
         let check = checks.max { lhs, rhs in
@@ -288,7 +312,7 @@ struct CodexStore: @unchecked Sendable {
             ? "；同时同步 \(associatedCount) 个关联线程"
             : ""
         let compatibilityMessage = compatibilityFixes > 0
-            ? "；将修复 \(compatibilityFixes) 条官方工具 ID"
+            ? "；将备份并修复 \(compatibilityFixes) 条历史兼容记录"
             : ""
         return ContextPreflight(
             level: check.level,
@@ -357,27 +381,41 @@ struct CodexStore: @unchecked Sendable {
     func switchTask(
         task: CodexTask,
         targetProvider: String,
-        allowRisk: Bool = false
+        allowRisk: Bool = false,
+        allowOpaqueHistory: Bool = false
     ) throws -> SwitchResult {
         try switchTasks(
             tasks: [task],
             targetProvider: targetProvider,
-            allowRisk: allowRisk
+            allowRisk: allowRisk,
+            allowOpaqueHistory: allowOpaqueHistory
         )
     }
 
     func switchTasks(
         tasks: [CodexTask],
         targetProvider: String,
-        allowRisk: Bool = false
+        allowRisk: Bool = false,
+        allowOpaqueHistory: Bool = false
     ) throws -> SwitchResult {
         let pendingTasks = tasks.filter { $0.provider != targetProvider }
         let check = try preflight(tasks: tasks, targetProvider: targetProvider)
         if check.level == .alreadyTarget {
             throw SwitcherError.invalidData("任务已经使用 \(ProviderOption.displayName(for: targetProvider))")
         }
-        if check.level == .blockedIncompatible {
+        if check.level == .blockedIncompatible
+            || (check.level == .blockedOpaqueHistory && !allowOpaqueHistory) {
             throw SwitcherError.unsafe(check.message)
+        }
+        if check.level == .blockedOpaqueHistory {
+            let providerBoundIDs = try pendingTasks.reduce(into: 0) { total, task in
+                total += try providerBoundItemIDCount(task: task)
+            }
+            guard providerBoundIDs == 0 else {
+                throw SwitcherError.unsafe(
+                    "仍检测到 \(providerBoundIDs) 条供应商绑定的工具调用 ID；即使确认丢弃加密历史，也不能安全迁移这些远端调用。"
+                )
+            }
         }
         if !allowRisk && (check.level == .blockedRisk || check.level == .blockedUnknown) {
             throw SwitcherError.unsafe(check.message)
@@ -389,7 +427,11 @@ struct CodexStore: @unchecked Sendable {
                 task: task,
                 targetProvider: targetProvider
             )
-            if task.provider != targetProvider || fixes > 0 {
+            let replay = try replayCompatibility(task: task)
+            let shouldDropOpaqueHistory = allowOpaqueHistory
+                && replay.opaqueItems > 0
+                && (task.provider != targetProvider || replay.hasReplayFailure)
+            if task.provider != targetProvider || fixes > 0 || shouldDropOpaqueHistory {
                 tasksToRewrite.append(task)
             }
         }
@@ -402,6 +444,7 @@ struct CodexStore: @unchecked Sendable {
 
         let databaseBackup = try backupDatabase()
         var rolloutBackups: [(task: CodexTask, source: URL, backup: URL)] = []
+        var rewrittenPaths: Set<String> = []
         var changedRecords = 0
         var compatibilityFixes = 0
 
@@ -417,8 +460,11 @@ struct CodexStore: @unchecked Sendable {
                 let rewrite = try rewriteRollout(
                     at: rolloutURL,
                     expectedThreadID: task.id,
-                    provider: targetProvider
+                    provider: targetProvider,
+                    portableReplay: try requiresPortableReplay(task: task, targetProvider: targetProvider),
+                    allowDroppingOpaqueHistory: allowOpaqueHistory
                 )
+                rewrittenPaths.insert(rolloutURL.path)
                 guard rewrite.providerRecords > 0 else {
                     throw SwitcherError.invalidData(
                         "任务 \(task.id) 的历史中没有可修改的 provider 元数据"
@@ -438,7 +484,7 @@ struct CodexStore: @unchecked Sendable {
                 compatibilityFixes: compatibilityFixes
             )
         } catch {
-            for item in rolloutBackups {
+            for item in rolloutBackups where rewrittenPaths.contains(item.source.path) {
                 try? restoreFile(from: item.backup, to: item.source)
             }
             throw error
@@ -618,8 +664,11 @@ struct CodexStore: @unchecked Sendable {
     private func rewriteRollout(
         at url: URL,
         expectedThreadID: String,
-        provider: String
+        provider: String,
+        portableReplay: Bool = false,
+        allowDroppingOpaqueHistory: Bool = false
     ) throws -> (changedRecords: Int, compatibilityFixes: Int, providerRecords: Int) {
+        let originalAttributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let temporaryURL = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
         FileManager.default.createFile(atPath: temporaryURL.path, contents: nil)
@@ -635,14 +684,35 @@ struct CodexStore: @unchecked Sendable {
         do {
             try forEachLine(in: url) { data, hadNewline in
                 var outputData = data
-                if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                if portableReplay {
+                    guard let record = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        throw SwitcherError.invalidData("历史记录不是有效的 JSON 对象")
+                    }
+                    guard let portable = try ReplayCompatibility.portableRecord(
+                        record,
+                        archiveImage: { imageURL in
+                            try archiveReplayImage(imageURL, threadID: expectedThreadID)
+                        },
+                        allowDroppingOpaqueHistory: allowDroppingOpaqueHistory
+                    ) else {
+                        changed += 1
+                        compatibilityFixes += 1
+                        return
+                    }
+                    if !NSDictionary(dictionary: record).isEqual(to: portable) {
+                        outputData = try JSONSerialization.data(withJSONObject: portable, options: [.sortedKeys, .withoutEscapingSlashes])
+                        changed += 1
+                        compatibilityFixes += 1
+                    }
+                }
+                if let object = try? JSONSerialization.jsonObject(with: outputData) as? [String: Any],
                    object["type"] as? String == "session_meta",
                    let payload = object["payload"] as? [String: Any] {
                     if foundThreadID == nil {
                         foundThreadID = (payload["id"] as? String) ?? (payload["session_id"] as? String)
                     }
                     if payload["model_provider"] is String,
-                       let line = String(data: data, encoding: .utf8) {
+                       let line = String(data: outputData, encoding: .utf8) {
                         providerRecords += 1
                         let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
                         let replacement = #""model_provider":"\#(provider)""#
@@ -657,13 +727,13 @@ struct CodexStore: @unchecked Sendable {
                         }
                     }
                 } else if provider == "openai",
-                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let object = try? JSONSerialization.jsonObject(with: outputData) as? [String: Any],
                           object["type"] as? String == "response_item",
                           let payload = object["payload"] as? [String: Any],
                           payload["type"] as? String == "tool_search_call",
                           let identifier = payload["id"] as? String,
                           let corrected = officialToolSearchIdentifier(identifier),
-                          let line = String(data: data, encoding: .utf8) {
+                          let line = String(data: outputData, encoding: .utf8) {
                     let escaped = NSRegularExpression.escapedPattern(for: identifier)
                     let identifierRegex = try NSRegularExpression(
                         pattern: #""id"\s*:\s*"\#(escaped)""#
@@ -681,6 +751,12 @@ struct CodexStore: @unchecked Sendable {
                         outputData = Data(updated.utf8)
                     }
                 }
+                if portableReplay {
+                    guard outputData.count <= data.count else {
+                        throw SwitcherError.invalidData("修复记录超过原长度，已停止以保护 Codex 分页索引")
+                    }
+                    outputData.append(Data(repeating: 0x20, count: data.count - outputData.count))
+                }
                 try output.write(contentsOf: outputData)
                 if hadNewline {
                     try output.write(contentsOf: Data([0x0A]))
@@ -696,6 +772,10 @@ struct CodexStore: @unchecked Sendable {
             }
 
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.size] as? NSNumber == originalAttributes[.size] as? NSNumber,
+                  attributes[.modificationDate] as? Date == originalAttributes[.modificationDate] as? Date else {
+                throw SwitcherError.unsafe("修复期间会话仍有新内容写入，已停止替换；请等会话完成后重试")
+            }
             if let permissions = attributes[.posixPermissions] {
                 try FileManager.default.setAttributes(
                     [.posixPermissions: permissions],
@@ -719,14 +799,14 @@ struct CodexStore: @unchecked Sendable {
         task: CodexTask,
         targetProvider: String
     ) throws -> Int {
-        guard targetProvider == "openai" else { return 0 }
         let url = URL(fileURLWithPath: task.rolloutPath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw SwitcherError.missingFile("找不到任务历史：\(url.path)")
         }
         var count = 0
         try forEachLine(in: url) { data, _ in
-            guard data.range(of: Data(#""tool_search_call""#.utf8)) != nil,
+            guard targetProvider == "openai",
+                  data.range(of: Data(#""tool_search_call""#.utf8)) != nil,
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   object["type"] as? String == "response_item",
                   let payload = object["payload"] as? [String: Any],
@@ -737,7 +817,63 @@ struct CodexStore: @unchecked Sendable {
             }
             count += 1
         }
+        let replay = try replayCompatibility(task: task)
+        if try requiresPortableReplay(task: task, targetProvider: targetProvider) {
+            count += replay.repairCount
+        }
         return count
+    }
+
+    func replayCompatibility(task: CodexTask) throws -> ReplayCompatibility {
+        var result = ReplayCompatibility()
+        try forEachLine(in: URL(fileURLWithPath: task.rolloutPath)) { data, _ in
+            guard let record = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw SwitcherError.invalidData("历史记录不是有效的 JSON 对象")
+            }
+            result.inspect(record)
+        }
+        return result
+    }
+
+    private func archiveReplayImage(_ imageURL: String, threadID: String) throws -> String {
+        guard let comma = imageURL.firstIndex(of: ",") else {
+            throw SwitcherError.invalidData("历史图片 data URL 不完整")
+        }
+        let header = String(imageURL[..<comma])
+        let extensions = ["data:image/png;base64": "png", "data:image/jpeg;base64": "jpg",
+                          "data:image/webp;base64": "webp", "data:image/gif;base64": "gif"]
+        guard let suffix = extensions[header],
+              let bytes = Data(base64Encoded: String(imageURL[imageURL.index(after: comma)...])) else {
+            throw SwitcherError.invalidData("历史图片格式无法无损归档，已停止修复")
+        }
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let directory = codexHome.appendingPathComponent("provider-switch-assets", isDirectory: true)
+            .appendingPathComponent(threadID, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let target = directory.appendingPathComponent("\(digest).\(suffix)")
+        if FileManager.default.fileExists(atPath: target.path) {
+            guard try Data(contentsOf: target) == bytes else {
+                throw SwitcherError.invalidData("历史图片归档校验失败")
+            }
+        } else {
+            try bytes.write(to: target, options: .atomic)
+        }
+        return target.path
+    }
+
+    private func requiresPortableReplay(task: CodexTask, targetProvider: String) throws -> Bool {
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: task.rolloutPath))
+        defer { try? handle.close() }
+        let header = try handle.read(upToCount: 64 * 1024) ?? Data()
+        guard let line = header.split(separator: 0x0A).first,
+              let record = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              record["type"] as? String == "session_meta",
+              let payload = record["payload"] as? [String: Any],
+              let sourceProvider = payload["model_provider"] as? String else {
+            throw SwitcherError.invalidData("无法确认历史文件的原供应商，已停止写入")
+        }
+        if sourceProvider != targetProvider { return true }
+        return try replayCompatibility(task: task).hasReplayFailure
     }
 
     func providerBoundItemIDCount(task: CodexTask) throws -> Int {
@@ -751,15 +887,31 @@ struct CodexStore: @unchecked Sendable {
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   object["type"] as? String == "response_item",
                   let metadata = object["metadata"] as? [String: Any],
-                  metadata["retained_source"] != nil,
+                  let retainedSource = metadata["retained_source"] as? [String: Any],
                   let payload = object["payload"] as? [String: Any],
+                  let payloadType = payload["type"] as? String,
                   let identifier = payload["id"] as? String,
-                  !identifier.isEmpty else {
+                  !identifier.isEmpty,
+                  retainedSourceItemID(retainedSource) == identifier,
+                  isProviderBoundItemType(payloadType) else {
                 return
             }
             count += 1
         }
         return count
+    }
+
+    private func retainedSourceItemID(_ retainedSource: [String: Any]) -> String? {
+        let id = retainedSource["id"] as? [String: Any]
+        return id?["item_id"] as? String ?? id?["tool_call_id"] as? String
+    }
+
+    private func isProviderBoundItemType(_ type: String) -> Bool {
+        // Ordinary message IDs are persisted locally and are not provider item IDs.
+        // Only response item kinds that carry remote/provider-owned identifiers
+        // make replaying the thread against another provider unsafe.
+        ["function_call", "function_call_output", "tool_call", "tool_call_output"]
+            .contains(type)
     }
 
     private func officialToolSearchIdentifier(_ identifier: String) -> String? {

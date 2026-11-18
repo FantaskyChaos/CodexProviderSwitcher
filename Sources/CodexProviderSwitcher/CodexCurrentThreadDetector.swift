@@ -217,14 +217,19 @@ private struct FocusedThreadEvent {
 
     init?<S: StringProtocol>(line: S) {
         let text = String(line)
-        guard text.contains("rendererWindowAppearance=primary"),
-              text.contains("rendererWindowFocused=true"),
-              text.contains("rendererWindowVisible=true") else { return nil }
-
+        let hasWindowMetadata = text.contains("rendererWindowAppearance=")
+            || text.contains("rendererWindowFocused=")
+            || text.contains("rendererWindowVisible=")
+        let focusedPrimaryWindow = text.contains("rendererWindowAppearance=primary")
+            && text.contains("rendererWindowFocused=true")
+            && text.contains("rendererWindowVisible=true")
         let explicit = text.contains("thread_stream_view_activity_changed active=true")
-        let fallback = text.contains("maybe_resume_started")
-            || text.contains("Reasoning summary turn-start")
-            || text.contains("Reasoning summary item completed")
+            && (!hasWindowMetadata || focusedPrimaryWindow)
+        let fallback = focusedPrimaryWindow && (
+            text.contains("maybe_resume_started")
+                || text.contains("Reasoning summary turn-start")
+                || text.contains("Reasoning summary item completed")
+        )
         guard explicit || fallback else { return nil }
 
         let id = Self.field("conversationId", in: text) ?? Self.field("threadId", in: text)

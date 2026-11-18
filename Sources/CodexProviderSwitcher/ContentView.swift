@@ -53,6 +53,14 @@ struct ContentView: View {
         } message: {
             Text("\(model.preflight.message)\n\n强制切换仍会保留 JSONL 和数据库备份。")
         }
+        .alert("切换会丢失部分加密上下文", isPresented: $model.showOpaqueHistoryRiskAlert) {
+            Button("取消", role: .cancel) {}
+            Button("备份后仍然切换", role: .destructive) {
+                model.forceSwitch()
+            }
+        } message: {
+            Text("\(model.preflight.message)\n\n继续后会先完整备份原始 JSONL 和数据库，再仅从当前会话副本移除无法解密的加密块。聊天中已有的明文内容和工具结果会保留；被移除的密文内容不能恢复到目标会话。")
+        }
         .alert("创建独立分支", isPresented: $model.showForkConfirmation) {
             Button("取消", role: .cancel) {}
             Button("创建分支") {
@@ -292,6 +300,15 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .help("安全退出并重新打开 Codex，等待定时任务提示处理完成后再打开此任务")
+
+                            Button {
+                                model.repairSelectedConversation()
+                            } label: {
+                                Label("修复会话兼容性", systemImage: "wrench.and.screwdriver")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(model.isBusy)
+                            .help("备份后清理失败会话的旧推理缓存和远端引用，再重新加载；保留对话和工具结果")
                         }
                     }
 
@@ -349,7 +366,7 @@ struct ContentView: View {
                     .disabled(!model.canForkAndSwitch)
                     .help("使用 Codex 官方分支功能，原任务不变")
 
-                    Text("直接切换会备份后修改原任务；新建分支会保留原任务。完成后 App 会把 Codex 置于前台，等待你处理可能出现的定时任务退出提醒，然后自动重新打开目标会话。")
+                    Text("切换会完整备份，并清理旧供应商的推理缓存与远端引用；聊天正文和工具结果保留。完成后只重启一次 Codex，退出确认会显示到前台。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -492,12 +509,15 @@ struct ContentView: View {
     }
 
     private func switchButtonTitle(task: CodexTask) -> String {
+        if model.preflight.level == .blockedOpaqueHistory {
+            return "确认风险后切换到 \(ProviderOption.displayName(for: model.targetProviderID))"
+        }
         if model.selectedRootTaskCount > 1 {
             return "批量切换 \(model.selectedRootTaskCount) 个会话到 \(ProviderOption.displayName(for: model.targetProviderID))"
         }
         if task.provider == model.targetProviderID {
             if model.preflight.compatibilityFixes > 0 {
-                return "修复官方兼容性"
+                return "修复会话兼容性"
             }
             return "已经是该提供商"
         }
@@ -522,6 +542,8 @@ struct ContentView: View {
             return "checkmark.seal.fill"
         case .blockedIncompatible:
             return "link.badge.plus"
+        case .blockedOpaqueHistory:
+            return "exclamationmark.triangle.fill"
         case .blockedRisk:
             return "exclamationmark.triangle.fill"
         case .blockedUnknown:
@@ -535,6 +557,8 @@ struct ContentView: View {
             return .green
         case .blockedIncompatible:
             return .red
+        case .blockedOpaqueHistory:
+            return .orange
         case .blockedRisk:
             return .orange
         case .blockedUnknown:
@@ -543,8 +567,11 @@ struct ContentView: View {
     }
 
     private var riskTitle: String {
+        if model.preflight.level == .blockedOpaqueHistory {
+            return "可备份后确认切换"
+        }
         if model.preflight.compatibilityFixes > 0 {
-            return "可修复官方兼容性"
+            return "可修复历史兼容性"
         }
         switch model.preflight.level {
         case .safe:
@@ -553,6 +580,8 @@ struct ContentView: View {
             return "无需切换"
         case .blockedIncompatible:
             return "需要配对接续会话"
+        case .blockedOpaqueHistory:
+            return "可备份后确认切换"
         case .blockedRisk:
             return "需要确认风险"
         case .blockedUnknown:

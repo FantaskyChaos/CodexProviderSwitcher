@@ -30,6 +30,7 @@ final class AppModel: ObservableObject {
     @Published var isBusy = false
     @Published var statusMessage = "正在读取本地任务…"
     @Published var showRiskAlert = false
+    @Published var showOpaqueHistoryRiskAlert = false
     @Published var showForkRiskAlert = false
     @Published var showForkConfirmation = false
     @Published var showResultAlert = false
@@ -1142,6 +1143,7 @@ final class AppModel: ObservableObject {
         !isBusy && preflight.level != .blockedIncompatible && (
             selectedTaskGroup.contains { $0.provider != targetProviderID }
                 || preflight.compatibilityFixes > 0
+                || preflight.level == .blockedOpaqueHistory
         )
     }
 
@@ -1150,6 +1152,7 @@ final class AppModel: ObservableObject {
             && selectedRootTaskCount == 1
             && selectedTask != nil
             && preflight.level != .blockedIncompatible
+            && preflight.level != .blockedOpaqueHistory
     }
 
     func refresh() {
@@ -1408,6 +1411,10 @@ final class AppModel: ObservableObject {
 
     func requestSwitch() {
         guard selectedTask != nil else { return }
+        if preflight.level == .blockedOpaqueHistory {
+            showOpaqueHistoryRiskAlert = true
+            return
+        }
         if preflight.level == .blockedIncompatible {
             presentError(SwitcherError.unsafe(preflight.message))
             return
@@ -1424,12 +1431,15 @@ final class AppModel: ObservableObject {
             presentError(SwitcherError.unsafe(preflight.message))
             return
         }
-        performSwitch(allowRisk: true)
+        performSwitch(
+            allowRisk: true,
+            allowOpaqueHistory: preflight.level == .blockedOpaqueHistory
+        )
     }
 
     func requestForkAndSwitch() {
         guard selectedTask != nil, selectedRootTaskCount == 1 else { return }
-        if preflight.level == .blockedIncompatible {
+        if preflight.level == .blockedIncompatible || preflight.level == .blockedOpaqueHistory {
             presentError(SwitcherError.unsafe(preflight.message))
             return
         }
@@ -1445,7 +1455,8 @@ final class AppModel: ObservableObject {
     }
 
     func forceForkAndSwitch() {
-        guard preflight.level != .blockedIncompatible else {
+        guard preflight.level != .blockedIncompatible,
+              preflight.level != .blockedOpaqueHistory else {
             presentError(SwitcherError.unsafe(preflight.message))
             return
         }
@@ -1461,6 +1472,30 @@ final class AppModel: ObservableObject {
             statusMessage = "已通知 Codex 打开任务；运行中的旧提供商状态可能仍需重启"
         } else {
             presentError(SwitcherError.invalidData("无法打开 Codex；请确认 Codex 已安装"))
+        }
+    }
+
+    func repairSelectedConversation() {
+        guard !isBusy, selectedRootTaskCount == 1, let task = selectedTask else { return }
+        isBusy = true
+        statusMessage = "正在备份并修复会话历史…"
+        let store = self.store
+        Task {
+            do {
+                let result = try await Task.detached {
+                    try store.switchTask(task: task, targetProvider: task.provider)
+                }.value
+                await reloadAfterSwitch(selecting: task.id)
+                statusMessage = "已修复 \(result.compatibilityFixes) 条历史记录，正在重新加载 Codex…"
+                try await CodexApplicationReloader.restartAndOpen(threadID: task.id) { [weak self] message in
+                    self?.statusMessage = message
+                }
+                statusMessage = "会话历史已修复，请在 Codex 中继续；完整原历史已有备份"
+            } catch {
+                presentError(error)
+                statusMessage = "修复或重新加载未完成：\(error.localizedDescription)"
+            }
+            isBusy = false
         }
     }
 
@@ -1483,7 +1518,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func performSwitch(allowRisk: Bool) {
+    private func performSwitch(allowRisk: Bool, allowOpaqueHistory: Bool = false) {
         guard let task = selectedTask else { return }
         let group = selectedTaskGroup
         let target = targetProviderID
@@ -1497,7 +1532,8 @@ final class AppModel: ObservableObject {
                     try store.switchTasks(
                         tasks: group,
                         targetProvider: target,
-                        allowRisk: allowRisk
+                        allowRisk: allowRisk,
+                        allowOpaqueHistory: allowOpaqueHistory
                     )
                 }
             }.value
@@ -1508,20 +1544,23 @@ final class AppModel: ObservableObject {
                     ? "已切换到 \(ProviderOption.displayName(for: target))。"
                     : "任务仍使用 \(ProviderOption.displayName(for: target))。"
                 let compatibilitySummary = value.compatibilityFixes > 0
-                    ? "\n已修复 \(value.compatibilityFixes) 条官方工具 ID 兼容记录。"
+                    ? "\n已修复 \(value.compatibilityFixes) 条历史兼容记录。"
+                    : ""
+                let opaqueHistorySummary = allowOpaqueHistory
+                    ? "\n已按确认从当前副本移除无法解密的历史块；完整原件保留在备份中。"
                     : ""
                 statusMessage = "\(providerSummary)已创建备份，正在自动重启 Codex…"
                 do {
                     try await CodexApplicationReloader.restartAndOpen(threadID: task.id) { [weak self] message in
                         self?.statusMessage = message
                     }
-                    statusMessage = "切换完成，Codex 已重新打开目标会话\(compatibilitySummary)"
+                    statusMessage = "切换完成，Codex 已重新打开目标会话\(compatibilitySummary)\(opaqueHistorySummary)"
                 } catch {
                     NSRunningApplication.current.activate(options: [.activateAllWindows])
                     resultAlertTitle = "切换已保存，但重启未完成"
                     resultAlertMessage = """
                     \(providerSummary)
-                    已处理 \(value.changedTasks) 个线程，修改 \(value.changedRecords) 条记录，并已创建完整备份。\(compatibilitySummary)
+                    已处理 \(value.changedTasks) 个线程，修改 \(value.changedRecords) 条记录，并已创建完整备份。\(compatibilitySummary)\(opaqueHistorySummary)
 
                     \(error.localizedDescription)
                     """

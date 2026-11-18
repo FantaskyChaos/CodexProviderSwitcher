@@ -20,12 +20,207 @@ struct SelfTest {
         try testBatchSwitchChecksIndependentRootsAndWritesOnce()
         try testSafeSwitchFromOfficialToExternal()
         try testProviderBoundItemIDsBlockEvenForcedSwitch()
+        try testRetainedSourceMessageIDsDoNotBlockSwitch()
+        try testPortableReplayPreservesConversationAndToolLinks()
+        try testEncryptedReasoningDoesNotBlockButOpaqueCompactionDoes()
+        try testRecoverableEncryptedMessageSwitchAndConfirmedOpaqueSwitch()
+        try runRequestedPreflight()
+        try testSameProviderReplayFailureIsRepairable()
         try testRepairsDatabaseWhenRolloutAlreadyUsesTargetProvider()
         try testRepairsCompatibilityWhenAlreadyOfficial()
         try testRiskGuardBlocksMutationWithoutExplicitOverride()
         try runOptionalOfficialForkSmokeTest()
         try runOptionalCompatibilityRepair()
+        try runRequestedReplayRepairs()
         print("All CodexProviderSwitcher self-tests passed.")
+    }
+
+    private static func runRequestedReplayRepairs() throws {
+        guard let ids = ProcessInfo.processInfo.environment["CODEX_REPLAY_REPAIR_THREADS"] else { return }
+        let store = CodexStore()
+        for id in ids.split(separator: ",").map(String.init) {
+            let task = try require(store.loadTasks().first { $0.id == id }, "Repair task missing")
+            let before = try store.replayCompatibility(task: task)
+            let result = try store.switchTask(task: task, targetProvider: task.provider)
+            let after = try store.replayCompatibility(task: task)
+            try expect(after.reasoningItems == 0 && after.itemIDs == 0 && after.largeImages == 0, "Replay repair incomplete")
+            print("Replay repair: \(id), reasoning \(before.reasoningItems) -> 0, IDs \(before.itemIDs) -> 0, inline images \(before.largeImages) -> 0, backups \(result.rolloutBackups), database \(result.databaseBackup)")
+        }
+    }
+
+    private static func runRequestedPreflight() throws {
+        guard let threadID = ProcessInfo.processInfo.environment["CODEX_PREFLIGHT_THREAD_ID"],
+              !threadID.isEmpty else { return }
+        let target = ProcessInfo.processInfo.environment["CODEX_PREFLIGHT_TARGET"] ?? "custom"
+        let store = CodexStore()
+        let task = try require(store.loadTasks().first { $0.id == threadID }, "Preflight task missing")
+        let result = try store.preflight(task: task, targetProvider: target)
+        print("Read-only preflight: \(threadID), level \(result.level.rawValue), fixes \(result.compatibilityFixes), message \(result.message)")
+    }
+
+    private static func testPortableReplayPreservesConversationAndToolLinks() throws {
+        let message: [String: Any] = ["type": "message", "id": "msg_1", "role": "user",
+                                      "content": [["type": "input_text", "text": "Original text"]]]
+        let reasoning: [String: Any] = ["type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "old-cache"]
+        let tool: [String: Any] = ["type": "custom_tool_call_output", "id": "ctco_1", "call_id": "call_1", "output": "Exact output"]
+        let record: [String: Any] = ["type": "compacted", "payload": [
+            "message": "Keep summary", "replacement_history": [message, reasoning, tool],
+            "replacement_history_metadata": [["retained_source": ["id": "old"]], [:], [:]]
+        ]]
+        let repaired = try require(ReplayCompatibility.portableRecord(record), "Missing repaired record")
+        let payload = try require(repaired["payload"] as? [String: Any], "Missing payload")
+        let history = try require(payload["replacement_history"] as? [[String: Any]], "Missing history")
+        try expect(history.count == 2, "Reasoning cache was not removed")
+        try expect((payload["replacement_history_metadata"] as? [Any])?.count == 2, "Metadata alignment changed")
+        try expect(payload["message"] as? String == "Keep summary", "Compaction summary changed")
+        try expect(history[0]["id"] == nil && history[1]["id"] == nil, "Remote IDs survived")
+        try expect(history[1]["call_id"] as? String == "call_1", "Tool pairing changed")
+        try expect(history[1]["output"] as? String == "Exact output", "Tool output changed")
+        try expect(
+            NSArray(array: history[0]["content"] as? [Any] ?? []).isEqual(to: message["content"] as? [Any] ?? []),
+            "User content changed"
+        )
+        let twice = try require(ReplayCompatibility.portableRecord(repaired), "Missing second repair")
+        try expect(NSDictionary(dictionary: repaired).isEqual(to: twice), "Repair must be idempotent")
+        let event: [String: Any] = ["type": "event_msg", "payload": ["type": "agent_reasoning", "text": "Visible summary"]]
+        let repairedEvent = try require(ReplayCompatibility.portableRecord(event), "UI event missing")
+        try expect(NSDictionary(dictionary: event).isEqual(to: repairedEvent), "UI event changed")
+    }
+
+    private static func testEncryptedReasoningDoesNotBlockButOpaqueCompactionDoes() throws {
+        var compatibility = ReplayCompatibility()
+        compatibility.inspect(["type": "response_item", "payload": [
+            "type": "reasoning", "encrypted_content": "discardable-cache"
+        ]])
+        try expect(compatibility.reasoningItems == 1, "Encrypted reasoning cache was not recognized")
+        try expect(compatibility.opaqueItems == 0, "Discardable reasoning cache was classified as opaque history")
+
+        compatibility.inspect(["type": "response_item", "payload": [
+            "type": "compaction", "encrypted_content": "unrecoverable-history"
+        ]])
+        try expect(compatibility.opaqueItems == 1, "Opaque encrypted compaction must remain blocked")
+    }
+
+    private static func testRecoverableEncryptedMessageSwitchAndConfirmedOpaqueSwitch() throws {
+        let recoverableFixture = try Fixture(inputTokens: 1_000)
+        defer { recoverableFixture.cleanup() }
+        let recoverableStore = CodexStore(codexHome: recoverableFixture.root)
+        let recoverableTask = try require(
+            recoverableStore.loadTasks().first { $0.id == Fixture.sourceID },
+            "Recoverable encrypted-message fixture missing"
+        )
+        let recoverableRecord: [String: Any] = ["type": "response_item", "payload": [
+            "type": "message", "id": "msg_encrypted_with_text", "role": "assistant",
+            "content": [["type": "output_text", "text": "Visible answer"]],
+            "encrypted_content": "provider-bound-secret"
+        ]]
+        let recoverableLine = try JSONSerialization.data(withJSONObject: recoverableRecord)
+        let recoverableHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: recoverableTask.rolloutPath))
+        try recoverableHandle.seekToEnd()
+        try recoverableHandle.write(contentsOf: recoverableLine + Data([0x0A]))
+        try recoverableHandle.close()
+
+        let recoverablePreflight = try recoverableStore.preflight(
+            task: recoverableTask,
+            targetProvider: "openai"
+        )
+        try expect(recoverablePreflight.level != .blockedOpaqueHistory,
+                   "Plaintext-backed encrypted assistant message should not block switching")
+        let recoverableResult = try recoverableStore.switchTask(
+            task: recoverableTask,
+            targetProvider: "openai"
+        )
+        let originalBackup = try String(contentsOfFile: recoverableResult.rolloutBackups[0], encoding: .utf8)
+        try expect(originalBackup.contains("provider-bound-secret"), "Original encrypted message was not preserved in backup")
+        let rewritten = try String(contentsOfFile: recoverableTask.rolloutPath, encoding: .utf8)
+        try expect(rewritten.contains("Visible answer"), "Plaintext assistant message was lost")
+        try expect(!rewritten.contains("provider-bound-secret"), "Encrypted provider-bound message content remained")
+
+        let opaqueFixture = try Fixture(inputTokens: 1_000)
+        defer { opaqueFixture.cleanup() }
+        let opaqueStore = CodexStore(codexHome: opaqueFixture.root)
+        let opaqueTask = try require(
+            opaqueStore.loadTasks().first { $0.id == Fixture.sourceID },
+            "Opaque encrypted-history fixture missing"
+        )
+        let opaqueRecord: [String: Any] = ["type": "response_item", "payload": [
+            "type": "compaction", "id": "cmp_opaque", "encrypted_content": "unrecoverable-payload"
+        ]]
+        let opaqueLine = try JSONSerialization.data(withJSONObject: opaqueRecord)
+        let opaqueHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: opaqueTask.rolloutPath))
+        try opaqueHandle.seekToEnd()
+        try opaqueHandle.write(contentsOf: opaqueLine + Data([0x0A]))
+        try opaqueHandle.close()
+        let opaqueOriginal = try Data(contentsOf: URL(fileURLWithPath: opaqueTask.rolloutPath))
+        let opaquePreflight = try opaqueStore.preflight(task: opaqueTask, targetProvider: "openai")
+        try expect(opaquePreflight.level == .blockedOpaqueHistory, "Opaque history did not request explicit confirmation")
+
+        var defaultBlocked = false
+        do {
+            _ = try opaqueStore.switchTask(task: opaqueTask, targetProvider: "openai", allowRisk: true)
+        } catch {
+            defaultBlocked = true
+        }
+        try expect(defaultBlocked, "Ordinary risk override bypassed opaque-history confirmation")
+        let afterBlockedAttempt = try Data(contentsOf: URL(fileURLWithPath: opaqueTask.rolloutPath))
+        try expect(afterBlockedAttempt == opaqueOriginal,
+                   "Blocked opaque-history attempt modified rollout")
+
+        let forcedResult = try opaqueStore.switchTask(
+            task: opaqueTask,
+            targetProvider: "openai",
+            allowRisk: true,
+            allowOpaqueHistory: true
+        )
+        let forcedBackup = try Data(contentsOf: URL(fileURLWithPath: forcedResult.rolloutBackups[0]))
+        try expect(forcedBackup == opaqueOriginal,
+                   "Forced-switch backup did not preserve original opaque history")
+        let forcedText = try String(contentsOfFile: opaqueTask.rolloutPath, encoding: .utf8)
+        try expect(!forcedText.contains("unrecoverable-payload"), "Confirmed switch retained opaque ciphertext")
+        try expect(forcedText.contains(#""type":"agent_reasoning""#), "Removed opaque item was not replaced by a replay marker")
+        try expect(forcedText.utf8.count == opaqueOriginal.count, "Forced portable replay changed JSONL byte length")
+        let updatedTask = try require(
+            opaqueStore.loadTasks().first { $0.id == Fixture.sourceID },
+            "Forced-switch task missing after rewrite"
+        )
+        try expect(updatedTask.provider == "openai", "Confirmed opaque-history switch did not update provider")
+    }
+
+    private static func testSameProviderReplayFailureIsRepairable() throws {
+        let fixture = try Fixture(inputTokens: 1_000, includeReplayFailure: true)
+        defer { fixture.cleanup() }
+        let store = CodexStore(codexHome: fixture.root)
+        let task = try require(store.loadTasks().first { $0.id == Fixture.sourceID }, "Repair fixture missing")
+        let imageBytes = Data(repeating: 0xAB, count: 800_000)
+        let image = "data:image/png;base64," + imageBytes.base64EncodedString()
+        let imageRecord: [String: Any] = ["type": "response_item", "payload": [
+            "type": "custom_tool_call_output", "id": "ctco_large", "call_id": "call_large",
+            "output": [["type": "input_image", "image_url": image], ["type": "input_text", "text": "Keep tool text"]]
+        ]]
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: task.rolloutPath))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: JSONSerialization.data(withJSONObject: imageRecord, options: [.withoutEscapingSlashes]))
+        try handle.write(contentsOf: Data([0x0A]))
+        try handle.close()
+        let before = try Data(contentsOf: URL(fileURLWithPath: task.rolloutPath))
+        let check = try store.preflight(task: task, targetProvider: "custom")
+        try expect(check.level == .safe && check.compatibilityFixes > 0, "Same-provider failure not repairable")
+        let result = try store.switchTask(task: task, targetProvider: "custom")
+        let backup = try Data(contentsOf: URL(fileURLWithPath: result.rolloutBackups[0]))
+        try expect(backup == before, "Repair backup differs")
+        let after = try store.replayCompatibility(task: task)
+        try expect(after.reasoningItems == 0 && after.itemIDs == 0 && after.largeImages == 0, "Repair left replay cache")
+        let assets = fixture.root.appendingPathComponent("provider-switch-assets/\(task.id)")
+        let files = try FileManager.default.contentsOfDirectory(at: assets, includingPropertiesForKeys: nil)
+        try expect(files.count == 1, "Large image was not archived")
+        let archivedBytes = try Data(contentsOf: files[0])
+        try expect(archivedBytes == imageBytes, "Image archive was not lossless")
+        let repairedData = try Data(contentsOf: URL(fileURLWithPath: task.rolloutPath))
+        try expect(repairedData.count == before.count, "Repair changed durable rollout size")
+        try expect(
+            repairedData.split(separator: 0x0A).map(\.count) == before.split(separator: 0x0A).map(\.count),
+            "Repair changed paginated byte offsets"
+        )
     }
 
     private static func runOptionalCompatibilityRepair() throws {
@@ -372,6 +567,20 @@ struct SelfTest {
             ) == .found(secondID),
             "Latest Codex activity should remain usable without accessibility permission"
         )
+
+        let updatedContents = contents + "\n"
+            + "2026-08-30T10:03:00.000Z info thread_stream_view_activity_changed active=true conversationId=\(firstID) resumeState=needs_resume streamRole=null"
+            + "\n2026-08-30T10:04:00.000Z info thread_stream_view_activity_changed active=false conversationId=\(secondID) resumeState=resumed streamRole=owner"
+        try updatedContents.write(to: log, atomically: true, encoding: .utf8)
+        try expect(
+            detector.detect(
+                tasks: loadedTasks,
+                processIdentifiers: [4242],
+                currentTitleOverride: nil,
+                accessibilityTrustedOverride: true
+            ) == .found(firstID),
+            "Current Codex log format without renderer focus fields was not detected"
+        )
     }
 
     private static func testForkProtocolUsesOfficialMethodAndTargetProvider() throws {
@@ -543,9 +752,9 @@ struct SelfTest {
         try expect(rollout.contains(#""model_provider":"openai""#), "JSONL was not updated")
         try expect(!rollout.contains(#""model_provider":"custom""#), "Old provider remains in JSONL")
         try expect(
-            rollout.contains(#""id":"tsc_fixture_0""#)
+            rollout.contains(#""call_id":"sg_call_fixture_0""#)
                 && !rollout.contains(#""id":"ts_fixture_0""#),
-            "Official tool-search ID was not repaired"
+            "Portable tool-search replay was not repaired"
         )
     }
 
@@ -703,6 +912,26 @@ struct SelfTest {
         try expect(rollout.contains(#""model_provider":"custom""#), "Blocked rollout was modified")
     }
 
+    private static func testRetainedSourceMessageIDsDoNotBlockSwitch() throws {
+        let fixture = try Fixture(inputTokens: 1_000, includeRetainedSourceMessages: true)
+        defer { fixture.cleanup() }
+
+        let store = CodexStore(codexHome: fixture.root)
+        let task = try require(
+            store.loadTasks().first(where: { $0.id == Fixture.sourceID }),
+            "Retained-source task missing"
+        )
+        let preflight = try store.preflight(task: task, targetProvider: "openai")
+        try expect(
+            preflight.providerBoundItemIDs == 0,
+            "Ordinary retained message IDs must not be counted as provider-bound items"
+        )
+        try expect(
+            preflight.level != .blockedIncompatible,
+            "Ordinary retained message IDs must not block provider switching"
+        )
+    }
+
     private static func testRepairsDatabaseWhenRolloutAlreadyUsesTargetProvider() throws {
         let fixture = try Fixture(inputTokens: 1_000)
         defer { fixture.cleanup() }
@@ -772,6 +1001,8 @@ private final class Fixture {
         inputTokens: Int = 1_000,
         includeInternalReview: Bool = false,
         includeProviderBoundItem: Bool = false,
+        includeRetainedSourceMessages: Bool = false,
+        includeReplayFailure: Bool = false,
         targetProvider: String = "openai",
         internalReviewProvider: String = "custom"
     ) throws {
@@ -814,7 +1045,9 @@ private final class Fixture {
             inputTokens: inputTokens,
             contextWindow: 20_000,
             legacyToolSearchID: "ts_fixture_0",
-            includeProviderBoundItem: includeProviderBoundItem
+            includeProviderBoundItem: includeProviderBoundItem,
+            includeRetainedSourceMessages: includeRetainedSourceMessages,
+            includeReplayFailure: includeReplayFailure
         )
         try makeRollout(
             at: targetRollout,
@@ -861,7 +1094,9 @@ private final class Fixture {
         inputTokens: Int,
         contextWindow: Int,
         legacyToolSearchID: String? = nil,
-        includeProviderBoundItem: Bool = false
+        includeProviderBoundItem: Bool = false,
+        includeRetainedSourceMessages: Bool = false,
+        includeReplayFailure: Bool = false
     ) throws {
         var lines = [
             #"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"\#(id)","model_provider":"\#(provider)"}}"#,
@@ -876,8 +1111,17 @@ private final class Fixture {
         }
         if includeProviderBoundItem {
             lines.append(
-                #"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","id":"msg_provider_fixture_0","role":"assistant","content":[]},"metadata":{"retained_source":{"id":{"message_id":"msg_provider_fixture_0","role":"assistant"},"revision":"retained_fixture","complete":true}}}"#
+                #"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","id":"fc_provider_fixture_0","call_id":"call_fixture"},"metadata":{"retained_source":{"id":{"item_id":"fc_provider_fixture_0"},"revision":"retained_fixture","complete":true}}}"#
             )
+        }
+        if includeRetainedSourceMessages {
+            lines.append(
+                #"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","id":"msg_retained_fixture_1","role":"assistant","content":[]},"metadata":{"retained_source":{"id":{"message_id":"msg_retained_fixture_1","role":"assistant"},"revision":"retained_fixture","complete":true}}}"#
+            )
+        }
+        if includeReplayFailure {
+            lines.append(#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_old","summary":[],"encrypted_content":"old-cache"}}"#)
+            lines.append(#"{"type":"event_msg","payload":{"type":"task_complete","error":{"message":"invalid_encrypted_content"}}}"#)
         }
         try (lines.joined(separator: "\n") + "\n").write(
             to: url,
